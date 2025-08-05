@@ -1,0 +1,390 @@
+<?php
+// config.php
+return [
+    'google' => [
+        'client_id' => getenv('GOOGLE_CLIENT_ID'),
+        'client_secret' => getenv('GOOGLE_CLIENT_SECRET'),
+        'redirect_uri' => 'https://google.makedev.com.au/oauth/callback',
+        'scopes' => [
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/documents'
+        ]
+    ],
+    'api_tokens' => [
+        // Add your secure API tokens here
+        'team_makeweb_token' => getenv('TEAM_MAKEWEB_API_TOKEN')
+    ],
+    'allowed_origins' => [
+        'https://team.makeweb.com.au',
+        'http://localhost:3000' // for development
+    ]
+];
+
+// Security.php
+class Security {
+    private $config;
+    
+    public function __construct($config) {
+        $this->config = $config;
+    }
+    
+    public function validateApiToken($token) {
+        if (empty($token)) {
+            return false;
+        }
+        
+        // Check against configured API tokens
+        return in_array($token, $this->config['api_tokens']);
+    }
+    
+    public function validateOrigin($origin) {
+        return in_array($origin, $this->config['allowed_origins']);
+    }
+    
+    public function generateStateToken() {
+        return bin2hex(random_bytes(32));
+    }
+    
+    public function validateStateToken($state) {
+        // In production, store this in Redis/session
+        // For now, we'll validate format
+        return preg_match('/^[a-f0-9]{64}$/', $state);
+    }
+}
+
+// GoogleAuth.php
+class GoogleAuth {
+    private $client;
+    private $config;
+    
+    public function __construct($config) {
+        $this->config = $config;
+        $this->initializeClient();
+    }
+    
+    private function initializeClient() {
+        $this->client = new Google_Client();
+        $this->client->setClientId($this->config['google']['client_id']);
+        $this->client->setClientSecret($this->config['google']['client_secret']);
+        $this->client->setRedirectUri($this->config['google']['redirect_uri']);
+        $this->client->setScopes($this->config['google']['scopes']);
+        $this->client->setAccessType('offline');
+        $this->client->setPrompt('consent');
+    }
+    
+    public function getAuthUrl($state) {
+        $this->client->setState($state);
+        return $this->client->createAuthUrl();
+    }
+    
+    public function authenticate($code) {
+        try {
+            $token = $this->client->fetchAccessTokenWithAuthCode($code);
+            if (isset($token['error'])) {
+                throw new Exception('Failed to fetch access token: ' . $token['error']);
+            }
+            return $token;
+        } catch (Exception $e) {
+            throw new Exception('Authentication failed: ' . $e->getMessage());
+        }
+    }
+    
+    public function setAccessToken($token) {
+        $this->client->setAccessToken($token);
+    }
+    
+    public function refreshTokenIfNeeded($token) {
+        $this->client->setAccessToken($token);
+        
+        if ($this->client->isAccessTokenExpired()) {
+            $refreshToken = $this->client->getRefreshToken();
+            if ($refreshToken) {
+                $newToken = $this->client->fetchAccessTokenWithRefreshToken($refreshToken);
+                return $newToken;
+            }
+        }
+        
+        return $token;
+    }
+    
+    public function getClient() {
+        return $this->client;
+    }
+}
+
+// GoogleDriveService.php
+class GoogleDriveService {
+    private $service;
+    private $auth;
+    
+    public function __construct(GoogleAuth $auth) {
+        $this->auth = $auth;
+        $this->service = new Google_Service_Drive($auth->getClient());
+    }
+    
+    public function createFolder($name, $parentId = null) {
+        $fileMetadata = new Google_Service_Drive_DriveFile([
+            'name' => $name,
+            'mimeType' => 'application/vnd.google-apps.folder'
+        ]);
+        
+        if ($parentId) {
+            $fileMetadata->setParents([$parentId]);
+        }
+        
+        try {
+            $folder = $this->service->files->create($fileMetadata, [
+                'fields' => 'id, name, webViewLink'
+            ]);
+            
+            return [
+                'id' => $folder->getId(),
+                'name' => $folder->getName(),
+                'webViewLink' => $folder->getWebViewLink()
+            ];
+        } catch (Exception $e) {
+            throw new Exception('Failed to create folder: ' . $e->getMessage());
+        }
+    }
+    
+    public function listFolders($query = null) {
+        $parameters = [
+            'q' => "mimeType='application/vnd.google-apps.folder' and trashed=false",
+            'fields' => 'files(id, name, webViewLink)',
+            'pageSize' => 100
+        ];
+        
+        if ($query) {
+            $parameters['q'] .= " and name contains '{$query}'";
+        }
+        
+        try {
+            $results = $this->service->files->listFiles($parameters);
+            return $results->getFiles();
+        } catch (Exception $e) {
+            throw new Exception('Failed to list folders: ' . $e->getMessage());
+        }
+    }
+}
+
+// TokenStorage.php
+class TokenStorage {
+    private $storageDir;
+    
+    public function __construct($storageDir = './tokens') {
+        $this->storageDir = $storageDir;
+        if (!is_dir($this->storageDir)) {
+            mkdir($this->storageDir, 0700, true);
+        }
+    }
+    
+    public function saveToken($userId, $token) {
+        $filename = $this->getTokenFilename($userId);
+        $encrypted = $this->encrypt(json_encode($token));
+        file_put_contents($filename, $encrypted);
+    }
+    
+    public function getToken($userId) {
+        $filename = $this->getTokenFilename($userId);
+        if (!file_exists($filename)) {
+            return null;
+        }
+        
+        $encrypted = file_get_contents($filename);
+        $decrypted = $this->decrypt($encrypted);
+        return json_decode($decrypted, true);
+    }
+    
+    private function getTokenFilename($userId) {
+        return $this->storageDir . '/' . hash('sha256', $userId) . '.token';
+    }
+    
+    private function encrypt($data) {
+        // In production, use proper encryption with a key from env
+        $key = getenv('ENCRYPTION_KEY');
+        $iv = openssl_random_pseudo_bytes(16);
+        $encrypted = openssl_encrypt($data, 'AES-256-CBC', $key, 0, $iv);
+        return base64_encode($iv . $encrypted);
+    }
+    
+    private function decrypt($data) {
+        $key = getenv('ENCRYPTION_KEY');
+        $data = base64_decode($data);
+        $iv = substr($data, 0, 16);
+        $encrypted = substr($data, 16);
+        return openssl_decrypt($encrypted, 'AES-256-CBC', $key, 0, $iv);
+    }
+}
+
+// index.php - Main entry point
+require_once 'vendor/autoload.php';
+
+$config = require 'config.php';
+$security = new Security($config);
+
+// CORS headers
+header('Access-Control-Allow-Origin: ' . implode(', ', $config['allowed_origins']));
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+header('Access-Control-Allow-Headers: Authorization, Content-Type');
+header('Content-Type: application/json');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    exit(0);
+}
+
+// Validate API token
+$token = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+$token = str_replace('Bearer ', '', $token);
+
+if (!$security->validateApiToken($token)) {
+    http_response_code(401);
+    echo json_encode(['error' => 'Unauthorized']);
+    exit;
+}
+
+// Router
+$uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+$method = $_SERVER['REQUEST_METHOD'];
+
+try {
+    switch ($uri) {
+        case '/oauth/authorize':
+            handleOAuthAuthorize($config, $security);
+            break;
+            
+        case '/oauth/callback':
+            handleOAuthCallback($config, $security);
+            break;
+            
+        case '/drive/folder':
+            if ($method === 'POST' && $_GET['action'] === 'create') {
+                handleCreateFolder($config);
+            } else if ($method === 'GET') {
+                handleListFolders($config);
+            }
+            break;
+            
+        default:
+            http_response_code(404);
+            echo json_encode(['error' => 'Not found']);
+    }
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode(['error' => $e->getMessage()]);
+}
+
+// Handler functions
+function handleOAuthAuthorize($config, $security) {
+    $auth = new GoogleAuth($config);
+    $state = $security->generateStateToken();
+    
+    // Store state in session/redis in production
+    session_start();
+    $_SESSION['oauth_state'] = $state;
+    
+    $authUrl = $auth->getAuthUrl($state);
+    
+    echo json_encode([
+        'auth_url' => $authUrl,
+        'state' => $state
+    ]);
+}
+
+function handleOAuthCallback($config, $security) {
+    session_start();
+    
+    $code = $_GET['code'] ?? '';
+    $state = $_GET['state'] ?? '';
+    
+    if (!$security->validateStateToken($state) || $state !== $_SESSION['oauth_state']) {
+        throw new Exception('Invalid state parameter');
+    }
+    
+    $auth = new GoogleAuth($config);
+    $token = $auth->authenticate($code);
+    
+    // Store token for the user
+    $storage = new TokenStorage();
+    $userId = 'default'; // In production, get from session/JWT
+    $storage->saveToken($userId, $token);
+    
+    // Redirect back to team.makeweb.com.au with success
+    header('Location: https://team.makeweb.com.au/wizard?oauth=success');
+}
+
+function handleCreateFolder($config) {
+    $input = json_decode(file_get_contents('php://input'), true);
+    $folderName = $input['name'] ?? '';
+    $parentId = $input['parent_id'] ?? null;
+    
+    if (empty($folderName)) {
+        throw new Exception('Folder name is required');
+    }
+    
+    // Get stored token
+    $storage = new TokenStorage();
+    $userId = 'default'; // In production, get from auth
+    $token = $storage->getToken($userId);
+    
+    if (!$token) {
+        http_response_code(401);
+        echo json_encode(['error' => 'No valid Google token found']);
+        return;
+    }
+    
+    $auth = new GoogleAuth($config);
+    $token = $auth->refreshTokenIfNeeded($token);
+    $auth->setAccessToken($token);
+    
+    $driveService = new GoogleDriveService($auth);
+    $folder = $driveService->createFolder($folderName, $parentId);
+    
+    echo json_encode([
+        'success' => true,
+        'folder' => $folder
+    ]);
+}
+
+function handleListFolders($config) {
+    $query = $_GET['q'] ?? null;
+    
+    $storage = new TokenStorage();
+    $userId = 'default';
+    $token = $storage->getToken($userId);
+    
+    if (!$token) {
+        http_response_code(401);
+        echo json_encode(['error' => 'No valid Google token found']);
+        return;
+    }
+    
+    $auth = new GoogleAuth($config);
+    $token = $auth->refreshTokenIfNeeded($token);
+    $auth->setAccessToken($token);
+    
+    $driveService = new GoogleDriveService($auth);
+    $folders = $driveService->listFolders($query);
+    
+    echo json_encode([
+        'success' => true,
+        'folders' => $folders
+    ]);
+}
+
+// .htaccess
+/*
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ index.php [QSA,L]
+*/
+
+// composer.json
+/*
+{
+    "require": {
+        "google/apiclient": "^2.13",
+        "google/apiclient-services": "^0.285"
+    }
+}
+*/
